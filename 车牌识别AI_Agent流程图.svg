@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="2300" viewBox="0 0 1400 2300" font-family="Microsoft YaHei, SimHei, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#555" />
+    </marker>
+    <marker id="arrowDash" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#e08a1e" />
+    </marker>
+  </defs>
+
+  <style>
+    .box { stroke-width: 1.5; rx: 8; ry: 8; }
+    .main { fill: #eef4fb; stroke: #4a78b5; }
+    .decision { fill: #fdf1e0; stroke: #d99a3d; }
+    .fail { fill: #fbe8e6; stroke: #c0554c; }
+    .side { fill: #eef8ee; stroke: #4f9b5c; }
+    .label { font-size: 15px; fill: #222; text-anchor: middle; }
+    .sublabel { font-size: 12px; fill: #555; text-anchor: middle; }
+    .edge { stroke: #555; stroke-width: 1.6; fill: none; marker-end: url(#arrow); }
+    .edgeDash { stroke: #e08a1e; stroke-width: 1.6; fill: none; stroke-dasharray: 5,4; marker-end: url(#arrowDash); }
+    .edgeFail { stroke: #c0554c; stroke-width: 1.6; fill: none; stroke-dasharray: 3,3; marker-end: url(#arrow); }
+    .title { font-size: 22px; font-weight: bold; text-anchor: middle; fill: #222; }
+    .sectionTitle { font-size: 13px; fill: #777; text-anchor: start; }
+  </style>
+
+  <text x="700" y="35" class="title">语音车牌识别 AI Agent 对话流程（修订版）</text>
+
+  <!-- 1. 用户说话 -->
+  <rect x="500" y="60" width="400" height="60" class="box main"/>
+  <text x="700" y="83" class="label">用户按录音键开始说 / 客户端 Silero VAD 检测到声音</text>
+  <text x="700" y="103" class="sublabel">本地 VAD：silero_vad.py（min_speech / min_silence 阈值判停）</text>
+
+  <!-- 2. 攒音频 -->
+  <rect x="500" y="150" width="400" height="60" class="box main"/>
+  <text x="700" y="173" class="label">客户端攒一整轮音频</text>
+  <text x="700" y="193" class="sublabel">按停键，或本地VAD/服务端判停确认说完</text>
+
+  <!-- side: EasyTurn -->
+  <rect x="960" y="150" width="380" height="60" class="box side"/>
+  <text x="1150" y="173" class="label">可选：服务端 EasyTurn 判停复核</text>
+  <text x="1150" y="193" class="sublabel">turn_taking.py，EASYTURN_ENABLED=1 时启用</text>
+  <path d="M900,180 H960" class="edgeDash"/>
+
+  <!-- 3. WAV 发送 -->
+  <rect x="500" y="240" width="400" height="55" class="box main"/>
+  <text x="700" y="273" class="label">整轮 WAV 一次性发给服务端</text>
+
+  <!-- ACK side node -->
+  <rect x="960" y="330" width="380" height="80" class="box side"/>
+  <text x="1150" y="353" class="label">ACK 即时衔接语（并行）</text>
+  <text x="1150" y="373" class="sublabel">plate_agent_ack.py：0/1/3/5秒定时推送</text>
+  <text x="1150" y="391" class="sublabel">"正在识别/正在复核…"，结果就绪即停止</text>
+
+  <!-- 4. Agent loop container -->
+  <rect x="420" y="330" width="480" height="330" fill="none" stroke="#999" stroke-width="1" stroke-dasharray="4,3" rx="10"/>
+  <text x="440" y="322" class="sectionTitle">Agent 迭代循环（最多8次） · plate_agent.py</text>
+  <path d="M700,295 V330" class="edge"/>
+  <path d="M900,357 H960" class="edgeDash"/>
+
+  <!-- 4a plan_next_action -->
+  <rect x="450" y="345" width="420" height="70" class="box decision"/>
+  <text x="660" y="368" class="label">大模型 plan_next_action()</text>
+  <text x="660" y="388" class="sublabel">有车牌吗→提取车牌 / 在确认吗→提取编辑或确认命令</text>
+
+  <!-- 4b tool execution -->
+  <rect x="450" y="440" width="420" height="60" class="box main"/>
+  <text x="660" y="463" class="label">Python 工具执行（PlateToolExecutor）</text>
+  <text x="660" y="480" class="sublabel">set_plate / replace_position / confirm_all 等</text>
+  <path d="M660,415 V440" class="edge"/>
+
+  <!-- 4c validation -->
+  <rect x="450" y="525" width="420" height="60" class="box decision"/>
+  <text x="660" y="548" class="label">规则校验：is_valid_plate_number()</text>
+  <text x="660" y="565" class="sublabel">车牌格式 / 易混淆字符检测</text>
+  <path d="M660,500 V525" class="edge"/>
+
+  <!-- fail branch -->
+  <rect x="70" y="525" width="300" height="60" class="box fail"/>
+  <text x="220" y="548" class="label">校验失败 / 编辑不合法</text>
+  <text x="220" y="565" class="sublabel">状态不更新，走失败话术模板</text>
+  <path d="M450,555 H370" class="edgeFail"/>
+  <path d="M220,585 V 640 H 500" class="edgeFail" marker-end="url(#arrow)"/>
+
+  <!-- observations feedback loop -->
+  <path d="M870,470 C 1000,470 1000,380 870,380" class="edgeDash" fill="none"/>
+  <text x="990" y="430" class="sublabel" transform="rotate(90 990 430)">observations 回填</text>
+  <path d="M660,585 C 660,610 660,300 660,345" class="edgeDash" fill="none" />
+  <text x="700" y="610" class="sublabel">未 finish 则继续下一次迭代</text>
+
+  <!-- finish -->
+  <rect x="450" y="700" width="420" height="55" class="box main"/>
+  <text x="660" y="733" class="label">模型返回 finish（task_status / reply_scene）</text>
+  <path d="M660,585 V620" class="edge" style="display:none"/>
+  <path d="M370,555 H 220" class="edge" style="display:none"/>
+  <path d="M660,700 V660" class="edge" style="display:none"/>
+
+  <!-- connect loop out -->
+  <path d="M660,660 V700" class="edge"/>
+
+  <!-- 5. update state -->
+  <rect x="500" y="790" width="400" height="55" class="box main"/>
+  <text x="700" y="823" class="label">更新车牌逐位状态（confirmed/need_confirm）</text>
+  <path d="M660,755 V790 H700" class="edge"/>
+
+  <!-- 6. generate reply -->
+  <rect x="500" y="880" width="400" height="70" class="box main"/>
+  <text x="700" y="903" class="label">生成口语话术</text>
+  <text x="700" y="923" class="sublabel">按 task_status × reply_scene 选择模板</text>
+  <path d="M700,845 V880" class="edge"/>
+
+  <!-- history side -->
+  <rect x="960" y="880" width="380" height="70" class="box side"/>
+  <text x="1150" y="903" class="label">生成历史摘要（并行）</text>
+  <text x="1150" y="923" class="sublabel">plate_agent_history.py，最近6轮注入下一轮</text>
+  <path d="M900,900 H960" class="edgeDash"/>
+
+  <!-- 7. TTS -->
+  <rect x="500" y="985" width="400" height="55" class="box main"/>
+  <text x="700" y="1018" class="label">TTS 合成，发回客户端播放</text>
+  <path d="M700,950 V985" class="edge"/>
+
+  <!-- 8. next turn -->
+  <rect x="500" y="1075" width="400" height="60" class="box main"/>
+  <text x="700" y="1098" class="label">用户听完，再开始下一轮</text>
+  <text x="700" y="1118" class="sublabel">携带历史摘要注入下一轮状态栏</text>
+  <path d="M700,1040 V1075" class="edge"/>
+
+  <!-- loop back to step1 -->
+  <path d="M500,1105 C 200,1105 200,90 500,90" class="edge"/>
+
+  <!-- legend -->
+  <rect x="60" y="1180" width="24" height="18" class="box main"/>
+  <text x="95" y="1195" font-size="13" fill="#333">主流程步骤</text>
+  <rect x="60" y="1210" width="24" height="18" class="box decision"/>
+  <text x="95" y="1225" font-size="13" fill="#333">决策 / 模型判断节点</text>
+  <rect x="60" y="1240" width="24" height="18" class="box fail"/>
+  <text x="95" y="1255" font-size="13" fill="#333">失败 / 回退分支</text>
+  <rect x="60" y="1270" width="24" height="18" class="box side"/>
+  <text x="95" y="1285" font-size="13" fill="#333">并行辅助环节（ACK / 历史摘要 / EasyTurn）</text>
+  <line x1="60" x2="90" y1="1310" y2="1310" class="edgeDash"/>
+  <text x="95" y="1315" font-size="13" fill="#333">并行触发 / 循环回填（虚线）</text>
+</svg>
