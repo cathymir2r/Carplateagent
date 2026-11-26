@@ -1,0 +1,211 @@
+import asyncio
+import base64
+import logging
+import time
+from typing import Any
+
+from realtime_audio_demo.config import CAPTURE_DIR, FINAL_MAX_TOKENS, QWEN_MODEL, normalize_model_name
+from realtime_audio_demo.services.audio_processing import audio_transcoder
+from realtime_audio_demo.services.interfaces import ChatModel, SpeechSynthesizer
+from realtime_audio_demo.services.final_plate import resolve_confirmed_plate_output
+from realtime_audio_demo.services.model_gateway import model_gateway
+from realtime_audio_demo.services.output_filter import normalize_assistant_output, validate_current_normalized_plate
+from realtime_audio_demo.services.plate_agent_history import build_plate_turn_summary
+from realtime_audio_demo.services.plate_agent_logging import safe_session_filename
+from realtime_audio_demo.services.plate_agent_messages import (
+    SESSION_OPENING_TEXT,
+    SESSION_OPENING_TTS_TEXT,
+    tagged_for_plain,
+)
+from realtime_audio_demo.services.plate_agent import PlateAgentState, get_plate_agent_service
+from realtime_audio_demo.services.prompt_provider import system_prompt_provider
+from realtime_audio_demo.services.qwen import normalize_history
+from realtime_audio_demo.services.speech import speech_synthesizer
+from realtime_audio_demo.session_store import (
+    append_plate_audio_turn,
+    append_audio_history,
+    append_history,
+    build_plate_audio_input,
+    clear_plate_audio_turns,
+    get_plate_agent_state,
+    get_plate_turn_summaries,
+    get_session_history,
+    append_plate_turn_summary,
+    reset_session_state,
+    update_plate_agent_state,
+)
+
+
+PREFIX_WARMUP_TEXT = "请只进行会话前缀预热，不要回答用户问题。只输出 OK。"
+logger = logging.getLogger("uvicorn.error")
+
+
+class ChatboxApplicationService:
+    def __init__(self, model_client: ChatModel, speech: SpeechSynthesizer) -> None:
+        self.model_client = model_client
+        self.speech = speech
+
+    async def start_session(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        model = normalize_model_name(payload.get("model") or QWEN_MODEL)
+        session_id = str(payload.get("session_id") or "").strip()
+        audio_data_url = None
+        if bool(payload.get("outputAudio")):
+            audio_data_url = await self.speech.synthesize(model=model, text=SESSION_OPENING_TTS_TEXT)
+
+        if session_id:
+            await reset_session_state(session_id)
+            await append_history(session_id, "assistant", SESSION_OPENING_TEXT)
+
+        asyncio.create_task(self.warmup_session_prefix(model, session_id))
+
+        return {
+            "session_id": session_id or None,
+            "text": SESSION_OPENING_TEXT,
+            "audio_data_url": audio_data_url,
+            "history_text": SESSION_OPENING_TEXT,
+            "speech_text": SESSION_OPENING_TEXT,
+            "output_is_json": False,
+        }, 200
+
+    async def warmup_session_prefix(self, model: str, session_id: str) -> None:
+        try:
+            history = normalize_history(await get_session_history(session_id)) if session_id else [
+                {"role": "assistant", "content": SESSION_OPENING_TEXT}
+            ]
+            await self.model_client.complete_text(
+                model=model,
+                text=PREFIX_WARMUP_TEXT,
+                prompt=system_prompt_provider.get_prompt(),
+                history=history,
+                max_tokens=1,
+                output_audio=False,
+            )
+        except Exception as exc:
+            logger.warning("session prefix warmup failed: %s", exc)
+
+    async def handle_text(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        user_text = str(payload.get("text") or "").strip()
+        if not user_text:
+            return {"message": "text is required"}, 400
+
+        model = normalize_model_name(payload.get("model") or QWEN_MODEL)
+        session_id = str(payload.get("session_id") or "").strip()
+        history = normalize_history(await get_session_history(session_id)) if session_id else normalize_history(payload.get("history"))
+        result, status_code = await self.model_client.complete_text(
+            model=model,
+            text=user_text,
+            prompt=system_prompt_provider.get_prompt(),
+            history=history,
+            max_tokens=FINAL_MAX_TOKENS,
+            output_audio=False,
+        )
+        if status_code >= 400:
+            return result, status_code
+
+        checked_text = validate_current_normalized_plate(result.get("text"))
+        final_text = await resolve_confirmed_plate_output(
+            model_client=self.model_client,
+            model=model,
+            assistant_text=checked_text,
+        )
+        result["text"] = final_text
+        normalized = normalize_assistant_output(final_text)
+        result["text"] = normalized.display_text
+        result["history_text"] = normalized.history_text
+        result["speech_text"] = normalized.speech_text
+        result["output_is_json"] = normalized.is_json
+        result["session_id"] = session_id or None
+        # Tagged TTS text never leaves the server: synthesize here and hand back audio only.
+        if bool(payload.get("outputAudio")) and normalized.tts_text:
+            result["audio_data_url"] = await self.speech.synthesize(model=model, text=normalized.tts_text)
+
+        if session_id:
+            await append_history(session_id, "user", user_text)
+            await append_history(session_id, "assistant", normalized.history_text)
+
+        return result, 200
+
+    async def synthesize_speech(self, payload: dict[str, Any]) -> dict[str, Any]:
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            return {"audio_data_url": None}
+        model = normalize_model_name(payload.get("model") or QWEN_MODEL)
+        # Clients only ever send plain text. Fixed replies are re-tagged server side;
+        # anything else is synthesized as-is.
+        return {"audio_data_url": await self.speech.synthesize(model=model, text=tagged_for_plain(text))}
+
+    async def handle_audio(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        audio_base64 = str(payload.get("audio_base64") or "").strip()
+        if not audio_base64:
+            return {"message": "audio_base64 is required"}, 400
+        if "," in audio_base64 and audio_base64.startswith("data:"):
+            audio_base64 = audio_base64.split(",", 1)[1]
+        try:
+            wav_bytes = base64.b64decode(audio_base64, validate=True)
+        except Exception as exc:
+            return {"message": f"bad audio_base64: {exc}"}, 400
+
+        model = normalize_model_name(payload.get("model") or QWEN_MODEL)
+        session_id = str(payload.get("session_id") or "").strip()
+        state = await get_plate_agent_state(session_id) if session_id else PlateAgentState()
+        turn_summaries = await get_plate_turn_summaries(session_id) if session_id else []
+        turn_wav_bytes = wav_bytes
+        input_wav_bytes = wav_bytes
+        if session_id:
+            input_wav_bytes = await build_plate_audio_input(
+                session_id,
+                turn_wav_bytes,
+                has_plate=state.has_car_plate,
+            )
+        input_path = CAPTURE_DIR / f"{safe_session_filename(session_id or 'http')}_{int(time.time() * 1000)}_input.wav"
+        audio_transcoder.save_wav(input_wav_bytes, input_path)
+        try:
+            agent = get_plate_agent_service(self.model_client)
+            agent_result = await agent.handle_audio_turn(
+                model=model,
+                wav_bytes=input_wav_bytes,
+                state=state,
+                session_id=session_id,
+                user_audio_path=str(input_path),
+                turn_summaries=turn_summaries,
+            )
+        except Exception as exc:
+            return {"message": f"upstream audio request failed: {exc}"}, 502
+        turn_summary = build_plate_turn_summary(
+            turn_index=len(turn_summaries) + 1,
+            before_state=state,
+            result=agent_result,
+        )
+        agent_result.state.turn_summaries = [*turn_summaries, turn_summary][-6:]
+        if session_id:
+            await append_audio_history(session_id, turn_wav_bytes)
+            await append_history(session_id, "assistant", agent_result.history_text)
+            await update_plate_agent_state(session_id, agent_result.state)
+            await append_plate_turn_summary(session_id, turn_summary)
+            if not state.has_car_plate:
+                if agent_result.state.has_car_plate:
+                    await clear_plate_audio_turns(session_id)
+                else:
+                    await append_plate_audio_turn(session_id, turn_wav_bytes)
+
+        audio_data_url = None
+        if bool(payload.get("outputAudio")):
+            audio_data_url = await self.speech.synthesize(model=model, text=agent_result.tts_text)
+
+        return {
+            "text": agent_result.text,
+            "audio_data_url": audio_data_url,
+            "history_text": agent_result.history_text,
+            "speech_text": agent_result.speech_text,
+            "user_history_text": "",
+            "user_display_text": "",
+            "output_is_json": True,
+            "latency_ms": agent_result.latency_ms,
+            "saved_input_wav": str(input_path),
+            "ttft_ms": None,
+            "agent_state": agent_result.state.to_context(),
+            "agent_debug": agent_result.debug,
+            "agent_turn_summary": turn_summary,
+        }, 200
+
+chatbox_service = ChatboxApplicationService(model_gateway, speech_synthesizer)
